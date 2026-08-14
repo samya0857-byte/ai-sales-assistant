@@ -9,7 +9,22 @@ import pandas as pd
 # OpenAI
 # =========================
 
-client = OpenAI()
+import os
+import streamlit as st
+from openai import OpenAI
+
+api_key = None
+
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    api_key = os.getenv("OPENAI_API_KEY")
+
+if not api_key:
+    st.error("找不到 OPENAI_API_KEY，請到 Streamlit Cloud → Settings → Secrets 設定。")
+    st.stop()
+
+client = OpenAI(api_key=api_key)
 
 
 # =========================
