@@ -173,6 +173,7 @@ def _meeting_company(payload):
     return None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def list_all_s3_meeting_json(max_objects=500):
     """Read Meeting JSON objects from S3 under sync-pipeline/meetings/.
 
@@ -1670,6 +1671,77 @@ def get_recent_lead_discoveries(limit=10):
     return rows
 
 
+def get_latest_lead_discovery_for_company(source_company):
+    """Restore the latest lead-discovery conclusion.
+
+    Priority:
+    1. Local SQLite for the current app runtime.
+    2. AWS S3 for durable recovery after refresh/redeploy/restart.
+    """
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT result_json
+        FROM lead_discoveries
+        WHERE source_company = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (source_company,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if row:
+        local_payload = safe_json_loads(row[0])
+        if local_payload:
+            return local_payload
+
+    if not AWS_S3_BUCKET:
+        return None
+
+    safe_company = re.sub(
+        r"[^0-9A-Za-z\u4e00-\u9fff_-]+",
+        "-",
+        source_company or "unknown-company"
+    ).strip("-")
+
+    prefix = f"{AWS_S3_PREFIX}/lead-discovery/"
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    candidates = []
+    for page_data in paginator.paginate(
+        Bucket=AWS_S3_BUCKET,
+        Prefix=prefix
+    ):
+        for item in page_data.get("Contents", []):
+            key = item.get("Key", "")
+            basename = key.rsplit("/", 1)[-1]
+
+            if (
+                key.lower().endswith(".json")
+                and basename.startswith(f"{safe_company}-")
+            ):
+                candidates.append(item)
+
+    if not candidates:
+        return None
+
+    latest = max(
+        candidates,
+        key=lambda item: item.get("LastModified")
+    )
+    obj = s3.get_object(
+        Bucket=AWS_S3_BUCKET,
+        Key=latest["Key"]
+    )
+    return json.loads(
+        obj["Body"].read().decode("utf-8")
+    )
+
+
 def backup_lead_discovery_to_s3(source_company, payload):
     if not AWS_S3_BUCKET:
         return None
@@ -1684,8 +1756,26 @@ def backup_lead_discovery_to_s3(source_company, payload):
 # Session State
 # =========================================================
 
-if "meeting_result" not in st.session_state:
-    st.session_state.meeting_result = None
+# Streamlit reruns the script after every widget interaction and page switch.
+# Keep durable UI conclusions in Session State instead of local variables.
+_STATE_DEFAULTS = {
+    "active_page": "🎙️ 新增會議",
+    "meeting_result": None,
+    "ask_sales_question": "",
+    "ask_sales_answer": None,
+    "knowledge_profiles": {},
+    "lead_results": {},
+    "lead_search_plans": {},
+    "lead_search_runs_by_company": {},
+    "kb_selected_company": None,
+}
+
+for _key, _default in _STATE_DEFAULTS.items():
+    if _key not in st.session_state:
+        if isinstance(_default, dict):
+            st.session_state[_key] = {}
+        else:
+            st.session_state[_key] = _default
 
 
 # =========================================================
@@ -1703,6 +1793,7 @@ page = st.sidebar.radio(
         "🧠 Knowledge Base",
         "☁️ AWS Integration",
     ],
+    key="active_page",
 )
 
 
@@ -2014,7 +2105,8 @@ elif page == "🧠 Knowledge Base":
         )
 
     if st.button("🔄 重新同步 Knowledge Base", use_container_width=True):
-        # Rerun forces a fresh S3 list/get instead of relying on old page state.
+        # Clear the cached S3 snapshot, then fetch it again.
+        list_all_s3_meeting_json.clear()
         st.rerun()
 
     try:
@@ -2050,10 +2142,20 @@ elif page == "🧠 Knowledge Base":
             "請先確認 AWS Integration 能列出 sync-pipeline/meetings/ 下的 JSON。"
         )
     else:
+        saved_company = st.session_state.get("kb_selected_company")
+        selected_index = (
+            companies.index(saved_company)
+            if saved_company in companies
+            else 0
+        )
+
         selected_company = st.selectbox(
             "選擇要作為 Look-alike 基準的既有客戶",
-            companies
+            companies,
+            index=selected_index,
+            key="_kb_company_widget"
         )
+        st.session_state["kb_selected_company"] = selected_company
 
         records = get_company_knowledge_from_records(
             selected_company,
@@ -2077,21 +2179,21 @@ elif page == "🧠 Knowledge Base":
         with st.expander("查看原始 Knowledge Base JSON"):
             st.json(records)
 
-        cache_key = f"knowledge_profile::{selected_company}"
-        if cache_key not in st.session_state:
-            st.session_state[cache_key] = None
-
         if st.button("🧠 AI 統整這個客戶的知識庫", use_container_width=True):
             if not records:
                 st.warning("找不到這家公司的有效 Meeting JSON。")
             else:
                 with st.spinner("正在統整需求、方案、預算訊號、阻礙與 Look-alike 特徵..."):
-                    st.session_state[cache_key] = summarize_company_knowledge(
-                        selected_company,
-                        records
+                    st.session_state["knowledge_profiles"][selected_company] = (
+                        summarize_company_knowledge(
+                            selected_company,
+                            records
+                        )
                     )
 
-        knowledge_profile = st.session_state.get(cache_key)
+        knowledge_profile = st.session_state["knowledge_profiles"].get(
+            selected_company
+        )
 
         if knowledge_profile:
             st.subheader("Customer Knowledge Profile")
@@ -2136,7 +2238,7 @@ elif page == "🧠 Knowledge Base":
                             geography=geography
                         )
 
-                    st.session_state["lead_search_plan"] = search_plan
+                    st.session_state["lead_search_plans"][selected_company] = search_plan
 
                     search_runs = []
                     progress = st.progress(0)
@@ -2163,8 +2265,8 @@ elif page == "🧠 Knowledge Base":
                         max_leads=max_leads
                     )
 
-                    st.session_state["lead_discovery_result"] = result
-                    st.session_state["lead_search_runs"] = search_runs
+                    st.session_state["lead_results"][selected_company] = result
+                    st.session_state["lead_search_runs_by_company"][selected_company] = search_runs
 
                     save_lead_discovery_local(selected_company, result)
 
@@ -2185,7 +2287,17 @@ elif page == "🧠 Knowledge Base":
                     st.error("❌ Lead Discovery 失敗")
                     st.exception(e)
 
-            result = st.session_state.get("lead_discovery_result")
+            result = st.session_state["lead_results"].get(selected_company)
+
+            # Restore the latest saved conclusion after a browser refresh or app restart.
+            if result is None:
+                restored_result = get_latest_lead_discovery_for_company(
+                    selected_company
+                )
+                if restored_result:
+                    st.session_state["lead_results"][selected_company] = restored_result
+                    result = restored_result
+
             if result:
                 st.divider()
                 st.subheader("🎯 Potential Leads")
@@ -2241,7 +2353,8 @@ elif page == "🧠 Knowledge Base":
                     data=json.dumps(result, ensure_ascii=False, indent=2),
                     file_name=f"{selected_company}_lead_discovery.json",
                     mime="application/json",
-                    use_container_width=True
+                    use_container_width=True,
+                    on_click="ignore"
                 )
 
             recent = get_recent_lead_discoveries(5)
@@ -2609,9 +2722,21 @@ elif page == "💬 Ask Sales AI":
                             input=f"SALES MEETING MEMORY:\n{sales_memory}\n\nQUESTION:\n{final_question}",
                             store=False,
                         )
-                    st.divider()
-                    st.subheader("🧠 Sales AI Answer")
-                    st.markdown(response.output_text)
+                    st.session_state["ask_sales_question"] = final_question
+                    st.session_state["ask_sales_answer"] = response.output_text
                 except Exception as e:
                     st.error("❌ Sales AI 查詢失敗")
                     st.exception(e)
+
+        if st.session_state.get("ask_sales_answer"):
+            st.divider()
+            st.subheader("🧠 Sales AI Answer")
+            st.caption(
+                f"Question：{st.session_state.get('ask_sales_question', '')}"
+            )
+            st.markdown(st.session_state["ask_sales_answer"])
+
+            if st.button("清除目前問答結果", key="clear_ask_sales_answer"):
+                st.session_state["ask_sales_question"] = ""
+                st.session_state["ask_sales_answer"] = None
+                st.rerun()
