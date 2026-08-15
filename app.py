@@ -130,6 +130,233 @@ def list_recent_s3_meetings(limit=20):
     return items[:limit]
 
 
+
+def _normalize_meeting_payload(payload):
+    """Normalize current/legacy meeting JSON shapes without inventing data."""
+    if not isinstance(payload, dict):
+        return None
+
+    # Current wrappers used by earlier prototypes.
+    if isinstance(payload.get("meeting_json"), dict):
+        payload = payload["meeting_json"]
+
+    # Current strict CRM JSON already lives at top level.
+    if any(k in payload for k in ["meeting_id", "company", "contact_name", "stage", "need"]):
+        return payload
+
+    # Some older builds may keep a structured record under sales_intelligence.
+    if isinstance(payload.get("sales_intelligence"), dict):
+        nested = payload["sales_intelligence"]
+        if any(k in nested for k in ["meeting_id", "company", "contact_name", "stage", "need"]):
+            return nested
+
+    return payload
+
+
+def _meeting_company(payload):
+    """Read company from current and legacy payload shapes."""
+    if not isinstance(payload, dict):
+        return None
+
+    company = payload.get("company")
+    if company:
+        return str(company).strip()
+
+    meeting_info = payload.get("meeting_info")
+    if isinstance(meeting_info, dict) and meeting_info.get("company"):
+        return str(meeting_info["company"]).strip()
+
+    account = payload.get("account")
+    if isinstance(account, dict) and account.get("company"):
+        return str(account["company"]).strip()
+
+    return None
+
+
+def list_all_s3_meeting_json(max_objects=500):
+    """Read Meeting JSON objects from S3 under sync-pipeline/meetings/.
+
+    Returns:
+        [
+          {
+            "key": "...",
+            "last_modified": "...",
+            "payload": {...}
+          }
+        ]
+    """
+    if not AWS_S3_BUCKET:
+        return []
+
+    prefix = f"{AWS_S3_PREFIX}/meetings/"
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+
+    results = []
+    seen = 0
+
+    for page_data in paginator.paginate(Bucket=AWS_S3_BUCKET, Prefix=prefix):
+        for item in page_data.get("Contents", []):
+            if seen >= max_objects:
+                return results
+
+            key = item.get("Key", "")
+            if not key.lower().endswith(".json"):
+                continue
+
+            try:
+                obj = s3.get_object(Bucket=AWS_S3_BUCKET, Key=key)
+                body = obj["Body"].read().decode("utf-8")
+                payload = json.loads(body)
+                payload = _normalize_meeting_payload(payload)
+
+                if isinstance(payload, dict):
+                    results.append({
+                        "key": key,
+                        "last_modified": (
+                            item.get("LastModified").isoformat()
+                            if item.get("LastModified")
+                            else None
+                        ),
+                        "payload": payload,
+                    })
+                    seen += 1
+            except Exception:
+                # Skip one malformed/unreadable object instead of breaking the whole KB.
+                continue
+
+    return results
+
+
+def get_local_meeting_records():
+    """Convert local SQLite rows into usable knowledge records.
+
+    Supports both the current strict meeting_json column and legacy rows.
+    """
+    records = []
+
+    for meeting in get_meetings():
+        (
+            row_id,
+            created_at,
+            company,
+            customer_name,
+            salesperson,
+            target_language,
+            transcript,
+            translation,
+            analysis,
+            meeting_json_raw,
+        ) = meeting
+
+        payload = safe_json_loads(meeting_json_raw)
+        payload = _normalize_meeting_payload(payload) if payload else None
+
+        if not isinstance(payload, dict):
+            parsed_analysis = safe_json_loads(analysis)
+
+            if isinstance(parsed_analysis, dict):
+                payload = _normalize_meeting_payload(parsed_analysis)
+
+            if not isinstance(payload, dict):
+                # Legacy fallback: preserve only facts already present in SQLite.
+                payload = {
+                    "meeting_id": f"legacy_local_{row_id}",
+                    "meeting_date": (
+                        str(created_at)[:10]
+                        if created_at else None
+                    ),
+                    "company": company,
+                    "contact_name": customer_name,
+                    "salesperson": salesperson,
+                    "transcript": transcript,
+                    "translation": translation,
+                    "legacy_record": True,
+                }
+
+        records.append({
+            "source": "local",
+            "source_id": f"sqlite:{row_id}",
+            "payload": payload,
+        })
+
+    return records
+
+
+def get_s3_meeting_records(max_objects=500):
+    records = []
+    for item in list_all_s3_meeting_json(max_objects=max_objects):
+        records.append({
+            "source": "s3",
+            "source_id": f"s3://{AWS_S3_BUCKET}/{item['key']}",
+            "payload": item["payload"],
+        })
+    return records
+
+
+def get_all_knowledge_records(include_local=True, include_s3=True):
+    """Merge local + AWS S3 records and deduplicate by meeting_id/source."""
+    combined = []
+
+    if include_local:
+        combined.extend(get_local_meeting_records())
+
+    if include_s3:
+        combined.extend(get_s3_meeting_records())
+
+    deduped = []
+    seen = set()
+
+    for item in combined:
+        payload = item.get("payload") or {}
+        meeting_id = (
+            payload.get("meeting_id")
+            if isinstance(payload, dict)
+            else None
+        )
+
+        dedupe_key = (
+            f"meeting_id:{meeting_id}"
+            if meeting_id
+            else item.get("source_id")
+        )
+
+        if dedupe_key in seen:
+            continue
+
+        seen.add(dedupe_key)
+        deduped.append(item)
+
+    return deduped
+
+
+def list_knowledge_companies(records):
+    companies = set()
+    for item in records:
+        company = _meeting_company(item.get("payload"))
+        if company:
+            companies.add(company)
+    return sorted(companies)
+
+
+def get_company_knowledge_from_records(company_name, records):
+    """Return all matching customer records from local SQLite and/or S3."""
+    target = (company_name or "").strip()
+    matched = []
+
+    for item in records:
+        payload = item.get("payload")
+        if _meeting_company(payload) == target:
+            # Include source traceability for debugging, but keep business JSON intact.
+            if isinstance(payload, dict):
+                record = dict(payload)
+                record["_knowledge_source"] = item.get("source")
+                record["_knowledge_source_id"] = item.get("source_id")
+                matched.append(record)
+
+    return matched
+
+
 def bedrock_converse(user_text, system_text=None):
     if not AWS_BEDROCK_MODEL_ID:
         raise RuntimeError("尚未設定 AWS_BEDROCK_MODEL_ID。")
@@ -1181,15 +1408,15 @@ SEARCH_PLAN_SCHEMA = {
 
 
 def get_company_knowledge(company_name):
-    """Return final CRM JSON records for one existing customer."""
-    records = []
-    for meeting in get_meetings():
-        if (meeting[2] or "").strip() != (company_name or "").strip():
-            continue
-        payload = safe_json_loads(meeting[9])
-        if payload:
-            records.append(payload)
-    return records
+    """Return knowledge records from BOTH local SQLite and AWS S3."""
+    all_records = get_all_knowledge_records(
+        include_local=True,
+        include_s3=True
+    )
+    return get_company_knowledge_from_records(
+        company_name,
+        all_records
+    )
 
 
 def summarize_company_knowledge(company_name, records):
@@ -1768,19 +1995,84 @@ elif page == "🧠 Knowledge Base":
         "先把既有客戶歷次 Meeting JSON 統整成客戶知識輪廓，再使用公開 Web Search 找出具相似需求或成長訊號的潛在新客戶。"
     )
 
-    meetings = get_meetings()
-    companies = sorted({(m[2] or "").strip() for m in meetings if (m[2] or "").strip()})
+    st.subheader("📦 Knowledge Sources")
+
+    source_col1, source_col2 = st.columns(2)
+
+    with source_col1:
+        use_local_kb = st.checkbox(
+            "讀取 Streamlit / SQLite",
+            value=True,
+            help="讀取目前 App 本機 SQLite 的 Meeting records。"
+        )
+
+    with source_col2:
+        use_s3_kb = st.checkbox(
+            "讀取 AWS S3",
+            value=True,
+            help=f"讀取 s3://{AWS_S3_BUCKET or '(未設定)'}/{AWS_S3_PREFIX}/meetings/"
+        )
+
+    if st.button("🔄 重新同步 Knowledge Base", use_container_width=True):
+        # Rerun forces a fresh S3 list/get instead of relying on old page state.
+        st.rerun()
+
+    try:
+        knowledge_records = get_all_knowledge_records(
+            include_local=use_local_kb,
+            include_s3=use_s3_kb
+        )
+    except Exception as e:
+        knowledge_records = get_all_knowledge_records(
+            include_local=use_local_kb,
+            include_s3=False
+        )
+        st.error(f"AWS S3 Knowledge Base 讀取失敗：{e}")
+
+    local_count = sum(1 for x in knowledge_records if x.get("source") == "local")
+    s3_count = sum(1 for x in knowledge_records if x.get("source") == "s3")
+
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Local records", local_count)
+    metric2.metric("AWS S3 records", s3_count)
+    metric3.metric("Total records", len(knowledge_records))
+
+    if use_s3_kb:
+        st.caption(
+            f"AWS path：s3://{AWS_S3_BUCKET or '(未設定)'}/{AWS_S3_PREFIX}/meetings/"
+        )
+
+    companies = list_knowledge_companies(knowledge_records)
 
     if not companies:
-        st.info("目前沒有可用的客戶 Meeting JSON。請先儲存至少一場 Meeting。")
+        st.warning(
+            "目前 Knowledge Base 沒讀到任何有 company 欄位的 Meeting JSON。"
+            "請先確認 AWS Integration 能列出 sync-pipeline/meetings/ 下的 JSON。"
+        )
     else:
         selected_company = st.selectbox(
             "選擇要作為 Look-alike 基準的既有客戶",
             companies
         )
-        records = get_company_knowledge(selected_company)
 
-        st.caption(f"Knowledge Base records：{len(records)}")
+        records = get_company_knowledge_from_records(
+            selected_company,
+            knowledge_records
+        )
+
+        local_selected = sum(
+            1 for r in records
+            if r.get("_knowledge_source") == "local"
+        )
+        s3_selected = sum(
+            1 for r in records
+            if r.get("_knowledge_source") == "s3"
+        )
+
+        st.caption(
+            f"Knowledge Base records：{len(records)} "
+            f"（Local {local_selected} / AWS S3 {s3_selected}）"
+        )
 
         with st.expander("查看原始 Knowledge Base JSON"):
             st.json(records)
