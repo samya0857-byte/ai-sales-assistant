@@ -5,3 +5,4 @@ pypdf>=5.0.0,<7
 pymupdf>=1.24.0,<2
 pytesseract>=0.3.13,<1
 Pillow>=10.0.0,<13
+boto3>=1.41.0,<2

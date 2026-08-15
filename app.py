@@ -13,6 +13,8 @@ from pypdf import PdfReader
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 
 
 # =========================================================
@@ -41,6 +43,124 @@ if not api_key:
     st.stop()
 
 client = OpenAI(api_key=api_key)
+
+
+# =========================================================
+# AWS (optional integration)
+# =========================================================
+
+def _secret_or_env(name, default=None):
+    try:
+        value = st.secrets.get(name, None)
+        if value not in (None, ""):
+            return str(value)
+    except Exception:
+        pass
+    value = os.getenv(name)
+    return value if value not in (None, "") else default
+
+
+AWS_REGION = _secret_or_env("AWS_REGION") or _secret_or_env("AWS_DEFAULT_REGION")
+AWS_ACCESS_KEY_ID = _secret_or_env("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = _secret_or_env("AWS_SECRET_ACCESS_KEY")
+AWS_SESSION_TOKEN = _secret_or_env("AWS_SESSION_TOKEN")
+AWS_S3_BUCKET = _secret_or_env("AWS_S3_BUCKET")
+AWS_S3_PREFIX = (_secret_or_env("AWS_S3_PREFIX", "sync-pipeline") or "sync-pipeline").strip("/")
+AWS_BEDROCK_MODEL_ID = _secret_or_env("AWS_BEDROCK_MODEL_ID")
+
+
+def get_aws_session():
+    """Create a boto3 Session from Streamlit secrets/env vars.
+
+    Supports both long-lived access keys and hackathon temporary credentials.
+    If AWS_SESSION_TOKEN exists it is passed automatically.
+    """
+    kwargs = {}
+    if AWS_REGION:
+        kwargs["region_name"] = AWS_REGION
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+        if AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    return boto3.Session(**kwargs)
+
+
+def get_aws_identity():
+    session = get_aws_session()
+    sts = session.client("sts")
+    return sts.get_caller_identity()
+
+
+def get_s3_client():
+    return get_aws_session().client("s3")
+
+
+def upload_json_to_s3(payload, key):
+    if not AWS_S3_BUCKET:
+        raise RuntimeError("尚未設定 AWS_S3_BUCKET。")
+    body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    get_s3_client().put_object(
+        Bucket=AWS_S3_BUCKET,
+        Key=key,
+        Body=body,
+        ContentType="application/json; charset=utf-8",
+        ServerSideEncryption="AES256",
+    )
+    return f"s3://{AWS_S3_BUCKET}/{key}"
+
+
+def backup_meeting_to_s3(result):
+    meeting_json = result.get("meeting_json", {})
+    meeting_id = meeting_json.get("meeting_id") or ("MTG-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    created_at = meeting_json.get("created_at") or datetime.now().isoformat(timespec="seconds")
+    date_part = created_at[:10] if len(created_at) >= 10 else datetime.now().strftime("%Y-%m-%d")
+    key = f"{AWS_S3_PREFIX}/meetings/{date_part}/{meeting_id}.json"
+
+    payload = dict(meeting_json)
+    payload["aws_storage"] = {
+        "provider": "Amazon S3",
+        "region": AWS_REGION,
+        "bucket": AWS_S3_BUCKET,
+        "key": key,
+        "uri": f"s3://{AWS_S3_BUCKET}/{key}",
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    uri = upload_json_to_s3(payload, key)
+    result["meeting_json"] = payload
+    return uri
+
+
+def list_recent_s3_meetings(limit=20):
+    if not AWS_S3_BUCKET:
+        return []
+    response = get_s3_client().list_objects_v2(
+        Bucket=AWS_S3_BUCKET, Prefix=f"{AWS_S3_PREFIX}/meetings/", MaxKeys=max(1, min(int(limit), 1000))
+    )
+    items = response.get("Contents", [])
+    items.sort(key=lambda x: x.get("LastModified"), reverse=True)
+    return items[:limit]
+
+
+def bedrock_converse(user_text, system_text=None):
+    if not AWS_BEDROCK_MODEL_ID:
+        raise RuntimeError("尚未設定 AWS_BEDROCK_MODEL_ID。")
+    client_br = get_aws_session().client("bedrock-runtime")
+    kwargs = {
+        "modelId": AWS_BEDROCK_MODEL_ID,
+        "messages": [
+            {"role": "user", "content": [{"text": user_text}]}
+        ],
+        "inferenceConfig": {
+            "maxTokens": 800,
+            "temperature": 0.2,
+        },
+    }
+    if system_text:
+        kwargs["system"] = [{"text": system_text}]
+    response = client_br.converse(**kwargs)
+    content = response.get("output", {}).get("message", {}).get("content", [])
+    return "".join(part.get("text", "") for part in content if isinstance(part, dict)).strip(), response
 
 
 # =========================================================
@@ -925,6 +1045,7 @@ page = st.sidebar.radio(
         "📚 Meeting History",
         "📊 Sales Dashboard",
         "💬 Ask Sales AI",
+        "☁️ AWS Integration",
     ],
 )
 
@@ -1196,7 +1317,117 @@ if page == "🎙️ 新增會議":
 
         if st.button("💾 儲存這場 Meeting", type="primary", use_container_width=True):
             save_meeting(result)
-            st.success("✅ Meeting 與 Strict JSON 已儲存！")
+            st.success("✅ Meeting 與 Strict JSON 已儲存到本機資料庫！")
+
+            if AWS_S3_BUCKET:
+                try:
+                    s3_uri = backup_meeting_to_s3(result)
+                    st.success(f"☁️ AWS S3 備份完成：{s3_uri}")
+                except Exception as aws_error:
+                    st.warning(f"⚠️ 本機已儲存，但 AWS S3 備份失敗：{aws_error}")
+            else:
+                st.info("ℹ️ 尚未設定 AWS_S3_BUCKET，因此本次只存到 SQLite。")
+
+
+# =========================================================
+# AWS Integration
+# =========================================================
+
+elif page == "☁️ AWS Integration":
+    st.title("☁️ AWS Integration")
+    st.write(
+        "這一頁用來確認 Streamlit App 是否真的連到 AWS。"
+        "目前整合：Amazon S3（保存 Meeting JSON）與 Amazon Bedrock（模型連線測試）。"
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("AWS Region", AWS_REGION or "未設定")
+    with c2:
+        st.metric("S3 Bucket", AWS_S3_BUCKET or "未設定")
+        st.caption(f"S3 Prefix：{AWS_S3_PREFIX}/")
+    with c3:
+        st.metric("Bedrock Model", AWS_BEDROCK_MODEL_ID or "未設定")
+
+    st.caption(
+        "若使用 Hackathon 的 Temporary Credentials，Secrets 必須同時包含 "
+        "AWS_ACCESS_KEY_ID、AWS_SECRET_ACCESS_KEY、AWS_SESSION_TOKEN 與主辦指定 AWS_REGION。"
+    )
+
+    st.divider()
+    st.subheader("1️⃣ 測試 AWS 身分")
+    if st.button("🔐 Test AWS Connection", use_container_width=True):
+        try:
+            identity = get_aws_identity()
+            st.success("✅ AWS 認證成功")
+            st.json({
+                "Account": identity.get("Account"),
+                "Arn": identity.get("Arn"),
+                "UserId": identity.get("UserId"),
+                "Region": AWS_REGION,
+            })
+        except Exception as e:
+            st.error("❌ AWS 認證失敗")
+            st.exception(e)
+
+    st.divider()
+    st.subheader("2️⃣ Amazon S3")
+    if not AWS_S3_BUCKET:
+        st.warning("尚未設定 AWS_S3_BUCKET。設定後，每次按『儲存這場 Meeting』都會自動備份 Strict Meeting JSON 到 S3。")
+    else:
+        if st.button("🪣 Test S3 Bucket", use_container_width=True):
+            try:
+                get_s3_client().head_bucket(Bucket=AWS_S3_BUCKET)
+                st.success(f"✅ 可以存取 S3：s3://{AWS_S3_BUCKET}")
+            except Exception as e:
+                st.error("❌ S3 存取失敗")
+                st.exception(e)
+
+        try:
+            recent = list_recent_s3_meetings(20)
+            if recent:
+                st.markdown("#### 最近的 AWS Meeting JSON")
+                rows = []
+                for item in recent:
+                    rows.append({
+                        "Key": item.get("Key"),
+                        "Size (KB)": round((item.get("Size", 0) or 0) / 1024, 2),
+                        "Last Modified": str(item.get("LastModified", "")),
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+
+    st.divider()
+    st.subheader("3️⃣ Amazon Bedrock")
+    if not AWS_BEDROCK_MODEL_ID:
+        st.info(
+            "Bedrock 是選配。請先在 AWS 確認可用模型，再把模型 ID 放進 Streamlit Secret："
+            "AWS_BEDROCK_MODEL_ID。核心語音轉錄與 Strict JSON 目前仍由 OpenAI 執行，避免今天臨時改壞。"
+        )
+    else:
+        bedrock_test_prompt = st.text_input(
+            "Bedrock 測試問題", value="請用一句繁體中文說明 Sales Intelligence 的用途。"
+        )
+        if st.button("🧠 Test Amazon Bedrock", use_container_width=True):
+            try:
+                with st.spinner("正在呼叫 Amazon Bedrock..."):
+                    answer, raw = bedrock_converse(
+                        bedrock_test_prompt,
+                        system_text="You are a concise B2B sales assistant. Reply in Traditional Chinese.",
+                    )
+                st.success("✅ Amazon Bedrock 呼叫成功")
+                st.write(answer)
+                with st.expander("查看 Bedrock metadata"):
+                    st.json({
+                        "model_id": AWS_BEDROCK_MODEL_ID,
+                        "region": AWS_REGION,
+                        "usage": raw.get("usage", {}),
+                        "metrics": raw.get("metrics", {}),
+                    })
+            except Exception as e:
+                st.error("❌ Bedrock 呼叫失敗")
+                st.exception(e)
 
 
 # =========================================================
