@@ -1,0 +1,29 @@
+{
+  "meeting_id": "m_001",
+  "meeting_date": "2026-08-14",
+  "company": "沐日食品",
+  "contact_name": "張怡君",
+  "contact_role": "行銷經理",
+  "customer_type": "品牌方",
+  "stage": "提案中",
+  "plan": "年約",
+  "need": "社群代操，需含內容拍攝",
+  "budget": 1200000,
+  "budget_confidence": "推估",
+  "timeline": null,
+  "objection": "擔心交接空窗期過長",
+  "decision_maker": {
+    "name": null,
+    "role": "老闆",
+    "attended": false
+  },
+  "next_action": "三天內寄送含拍攝的年約版本報價",
+  "follow_up_raw": "下週三",
+  "follow_up_date": "2026-08-19",
+  "quotes": {
+    "budget": "我們今年這塊大概抓一百二左右",
+    "objection": "光是交接就搞了快三個月",
+    "plan": "年約我是可以接受啦",
+    "decision_maker": "還是要給我們老闆看過才能定"
+  }
+}

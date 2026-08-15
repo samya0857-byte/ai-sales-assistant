@@ -111,24 +111,12 @@ def upload_json_to_s3(payload, key):
 
 
 def backup_meeting_to_s3(result):
+    """Upload the final CRM JSON exactly as generated, without adding extra fields."""
     meeting_json = result.get("meeting_json", {})
     meeting_id = meeting_json.get("meeting_id") or ("MTG-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
-    created_at = meeting_json.get("created_at") or datetime.now().isoformat(timespec="seconds")
-    date_part = created_at[:10] if len(created_at) >= 10 else datetime.now().strftime("%Y-%m-%d")
+    date_part = meeting_json.get("meeting_date") or datetime.now().strftime("%Y-%m-%d")
     key = f"{AWS_S3_PREFIX}/meetings/{date_part}/{meeting_id}.json"
-
-    payload = dict(meeting_json)
-    payload["aws_storage"] = {
-        "provider": "Amazon S3",
-        "region": AWS_REGION,
-        "bucket": AWS_S3_BUCKET,
-        "key": key,
-        "uri": f"s3://{AWS_S3_BUCKET}/{key}",
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-    }
-    uri = upload_json_to_s3(payload, key)
-    result["meeting_json"] = payload
-    return uri
+    return upload_json_to_s3(meeting_json, key)
 
 
 def list_recent_s3_meetings(limit=20):
@@ -198,106 +186,80 @@ SALES_INTELLIGENCE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "speaker_roles": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "speaker": {"type": "string"},
-                    "role": {
-                        "type": "string",
-                        "enum": [
-                            "sales_rep",
-                            "customer",
-                            "decision_maker",
-                            "other",
-                            "unknown",
-                        ],
-                    },
-                    "confidence": {
-                        "type": "string",
-                        "enum": ["high", "medium", "low"],
-                    },
-                    "reason": {"type": "string"},
-                },
-                "required": ["speaker", "role", "confidence", "reason"],
-            },
+        "meeting_id": {"type": "string"},
+        "meeting_date": {"type": "string"},
+        "company": {"type": ["string", "null"]},
+        "contact_name": {"type": ["string", "null"]},
+        "contact_role": {"type": ["string", "null"]},
+        "customer_type": {"type": ["string", "null"]},
+        "stage": {
+            "type": "string",
+            "enum": [
+                "初次接觸",
+                "需求確認",
+                "提案中",
+                "議價中",
+                "決策中",
+                "成交",
+                "暫緩",
+                "流失",
+                "未判定"
+            ]
         },
-        "summary": {"type": "string"},
-        "customer_needs": {
-            "type": "array",
-            "items": {"type": "string"},
+        "plan": {"type": ["string", "null"]},
+        "need": {"type": ["string", "null"]},
+        "budget": {"type": ["integer", "null"]},
+        "budget_confidence": {
+            "type": "string",
+            "enum": ["明確", "推估", "未提及"]
         },
-        "pain_points": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "budget": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "mentioned": {"type": "boolean"},
-                "amount": {"type": ["number", "null"]},
-                "currency": {"type": ["string", "null"]},
-                "period": {"type": ["string", "null"]},
-                "raw_text": {"type": "string"},
-            },
-            "required": ["mentioned", "amount", "currency", "period", "raw_text"],
-        },
+        "timeline": {"type": ["string", "null"]},
+        "objection": {"type": ["string", "null"]},
         "decision_maker": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "mentioned": {"type": "boolean"},
                 "name": {"type": ["string", "null"]},
                 "role": {"type": ["string", "null"]},
-                "evidence": {"type": "string"},
+                "attended": {"type": "boolean"}
             },
-            "required": ["mentioned", "name", "role", "evidence"],
+            "required": ["name", "role", "attended"]
         },
-        "objections": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "next_actions": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "follow_up": {
+        "next_action": {"type": ["string", "null"]},
+        "follow_up_raw": {"type": ["string", "null"]},
+        "follow_up_date": {"type": ["string", "null"]},
+        "quotes": {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "mentioned": {"type": "boolean"},
-                "raw_text": {"type": "string"},
-                "normalized_date": {"type": ["string", "null"]},
+                "budget": {"type": ["string", "null"]},
+                "objection": {"type": ["string", "null"]},
+                "plan": {"type": ["string", "null"]},
+                "decision_maker": {"type": ["string", "null"]}
             },
-            "required": ["mentioned", "raw_text", "normalized_date"],
-        },
-        "opportunity_score": {
-            "type": "string",
-            "enum": ["HIGH", "MEDIUM", "LOW"],
-        },
-        "opportunity_reason": {"type": "string"},
-        "sales_recommendations": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
+            "required": ["budget", "objection", "plan", "decision_maker"]
+        }
     },
     "required": [
-        "speaker_roles",
-        "summary",
-        "customer_needs",
-        "pain_points",
+        "meeting_id",
+        "meeting_date",
+        "company",
+        "contact_name",
+        "contact_role",
+        "customer_type",
+        "stage",
+        "plan",
+        "need",
         "budget",
+        "budget_confidence",
+        "timeline",
+        "objection",
         "decision_maker",
-        "objections",
-        "next_actions",
-        "follow_up",
-        "opportunity_score",
-        "opportunity_reason",
-        "sales_recommendations",
-    ],
+        "next_action",
+        "follow_up_raw",
+        "follow_up_date",
+        "quotes"
+    ]
 }
 
 DEMO_TRANSCRIPT = """Speaker A: 我們公司目前有 20 個業務，每天都會跟很多客戶開會，但是大家都不太願意把會議內容整理進 CRM，所以主管常常不知道案件現在談到哪裡。
@@ -415,15 +377,35 @@ def safe_json_loads(value):
         return None
 
 
+def stage_to_opportunity_score(stage):
+    """Dashboard-only grouping derived from the CRM stage; not part of the final JSON schema."""
+    mapping = {
+        "成交": "HIGH",
+        "決策中": "HIGH",
+        "議價中": "HIGH",
+        "提案中": "MEDIUM",
+        "需求確認": "MEDIUM",
+        "初次接觸": "LOW",
+        "暫緩": "LOW",
+        "流失": "LOW",
+        "未判定": "UNKNOWN",
+    }
+    return mapping.get(stage, "UNKNOWN")
+
+
 def extract_opportunity_score(analysis):
+    """Support both the new stage-based CRM record and legacy opportunity_score records."""
     parsed = safe_json_loads(analysis)
     if isinstance(parsed, dict):
-        score = parsed.get("opportunity_score")
-        if score in {"HIGH", "MEDIUM", "LOW"}:
-            return score
+        stage_score = stage_to_opportunity_score(parsed.get("stage"))
+        if stage_score != "UNKNOWN":
+            return stage_score
+        legacy_score = parsed.get("opportunity_score")
+        if legacy_score in {"HIGH", "MEDIUM", "LOW"}:
+            return legacy_score
 
     text = str(analysis or "").upper()
-    match = re.search(r"OPPORTUNITY SCORE.*?\b(HIGH|MEDIUM|LOW)\b", text, re.DOTALL)
+    match = re.search(r"OPPORTUNITY SCORE.*?\\b(HIGH|MEDIUM|LOW)\\b", text, re.DOTALL)
     if match:
         return match.group(1)
     for score in ("HIGH", "MEDIUM", "LOW"):
@@ -784,24 +766,51 @@ def analyze_sales_strict(transcription_payload):
     response = client.responses.create(
         model="gpt-5-mini",
         instructions="""
-你是一個 B2B Sales Intelligence Assistant。
-你會收到一份結構化的會議資料，其中可能來自：多人語音轉錄、上傳逐字稿、PDF、TXT、JSON 或示範資料。
+你是一個台灣 B2B Sales Intelligence Assistant。
+你的任務是把會議資料轉換成「單一、可直接寫入 CRM / S3 / LINE / Gmail pipeline」的嚴格 JSON Record。
 
-規則：
-1. 只能根據輸入資料中實際存在的資訊，不可捏造。
-2. Speaker label 只是講者分群；除非語意證據足夠，不可強行指定真實身份。
-3. 資料未提及時：字串用「未提及」、陣列用空陣列、nullable 數值或日期用 null。
-4. normalized_date 只有在能合理正規化時才填 YYYY-MM-DD；否則 null。
-5. opportunity_score 僅能 HIGH / MEDIUM / LOW。
-6. 使用繁體中文描述 summary、reason、needs、pain points、objections、actions、recommendations。
-7. 請嚴格遵守提供的 JSON Schema，不要輸出 Schema 以外欄位。
+輸出欄位已由 JSON Schema 固定。請遵守以下規則：
+
+1. 只能使用輸入 metadata 與逐字稿中實際存在的資訊，不可捏造。
+2. meeting_id：原封不動複製輸入的 meeting_id。
+3. meeting_date：取輸入 created_at 的日期部分，格式 YYYY-MM-DD。
+4. company：原封不動複製 meeting_info.company；沒有則 null。
+5. contact_name：原封不動複製 meeting_info.customer_name；沒有則 null。
+6. contact_role：只在逐字稿有足夠證據時填寫，例如「行銷經理」；否則 null。
+7. customer_type：只在能從逐字稿合理辨識時填寫，例如品牌方、代理商、企業客戶；否則 null。
+8. stage 只能選：初次接觸、需求確認、提案中、議價中、決策中、成交、暫緩、流失、未判定。
+   - 不確定時使用「未判定」，不要硬猜。
+9. plan：客戶實際討論或接受的方案，例如年約、月約、Pilot；未提及則 null。
+10. need：用一句精簡文字整理客戶核心需求；沒有明確需求則 null。
+11. budget：只輸出整數新台幣金額，不含「元」「萬」或逗號；沒有則 null。
+12. budget_confidence：
+   - 客戶明確確認正式預算 → 「明確」
+   - 「大概」「左右」「抓一百二」等非精確或需語境換算 → 「推估」
+   - 完全沒提 → 「未提及」
+13. 台灣商務口語金額可依上下文換算。例如「今年這塊大概抓一百二左右」若語境明確指年度預算百萬元級，可解析為 1200000，並標示「推估」；若語境不足則 budget=null。
+14. timeline：產品導入、採購、上線或專案時程；沒有則 null。不要把單純 follow-up 日期重複填進 timeline。
+15. objection：只填最主要成交阻礙；沒有則 null。
+16. decision_maker：
+   - name：有具名才填，否則 null。
+   - role：例如「老闆」「業務副總」；沒有則 null。
+   - attended：只有決策者本人確定出席本場 Meeting 才是 true。若只是說「要給老闆看」必須是 false。
+17. next_action：必須是業務可以執行的一個具體下一步；沒有足夠資訊則 null。
+18. follow_up_raw：保留逐字稿中的原始時間說法，例如「下週三」；沒有則 null。
+19. follow_up_date：以 meeting_date 為基準把相對日期正規化為 YYYY-MM-DD。無法可靠推算時 null。
+20. quotes：必須是逐字稿中「原句證據」，不可改寫、不可摘要、不可創造。
+   - budget：支撐 budget 的原句；沒有則 null。
+   - objection：支撐 objection 的原句；沒有則 null。
+   - plan：支撐 plan 的原句；沒有則 null。
+   - decision_maker：支撐 decision_maker 的原句；沒有則 null。
+21. Speaker label 只是講者分群，不代表身份；不要因 A/B 標籤自行假設誰是客戶。
+22. 不要輸出 JSON Schema 以外的欄位，也不要輸出任何 JSON 以外的文字。
 """,
         input=json.dumps(transcription_payload, ensure_ascii=False, indent=2),
         text={
             "format": {
                 "type": "json_schema",
-                "name": "sales_intelligence",
-                "description": "Structured B2B sales intelligence extracted from a meeting transcript.",
+                "name": "sales_meeting_record",
+                "description": "Strict CRM-ready B2B sales meeting record with evidence quotes.",
                 "strict": True,
                 "schema": SALES_INTELLIGENCE_SCHEMA,
             }
@@ -816,65 +825,58 @@ def render_sales_intelligence(data):
         st.write(data)
         return
 
-    st.subheader("🗣️ 講者角色判斷")
-    roles = data.get("speaker_roles", [])
-    if roles:
-        for item in roles:
-            st.write(
-                f"- **{item.get('speaker', '?')}** → `{item.get('role', 'unknown')}` "
-                f"({item.get('confidence', 'low')})：{item.get('reason', '')}"
-            )
-    else:
-        st.write("未提及")
-
-    st.subheader("📌 會議摘要")
-    st.write(data.get("summary", "未提及"))
+    st.subheader("📇 CRM Meeting Record")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Stage", data.get("stage") or "未判定")
+    with c2:
+        budget = data.get("budget")
+        st.metric("Budget", f"NT${budget:,}" if isinstance(budget, int) else "未提及")
+        st.caption(f"信心：{data.get('budget_confidence', '未提及')}")
+    with c3:
+        st.metric("Plan", data.get("plan") or "未提及")
+    with c4:
+        st.metric("Follow-up", data.get("follow_up_date") or data.get("follow_up_raw") or "未提及")
 
     left, right = st.columns(2)
     with left:
-        st.subheader("🎯 客戶需求")
-        needs = data.get("customer_needs", [])
-        st.write("\n".join(f"- {x}" for x in needs) if needs else "未提及")
+        st.subheader("👤 Contact")
+        st.write(f"**公司：** {data.get('company') or '未提及'}")
+        st.write(f"**姓名：** {data.get('contact_name') or '未提及'}")
+        st.write(f"**職稱：** {data.get('contact_role') or '未提及'}")
+        st.write(f"**客戶類型：** {data.get('customer_type') or '未提及'}")
 
-        st.subheader("⚠️ 客戶痛點")
-        pain = data.get("pain_points", [])
-        st.write("\n".join(f"- {x}" for x in pain) if pain else "未提及")
+        st.subheader("🎯 Need")
+        st.write(data.get("need") or "未提及")
 
-        st.subheader("💰 預算 / 價格訊號")
-        budget = data.get("budget", {})
-        st.write(budget.get("raw_text") or "未提及")
-
-        st.subheader("👤 決策者")
-        dm = data.get("decision_maker", {})
-        if dm.get("mentioned"):
-            st.write(f"{dm.get('name') or '未具名'} / {dm.get('role') or '角色未提及'}")
-            st.caption(dm.get("evidence", ""))
-        else:
-            st.write("未提及")
+        st.subheader("🗓️ Timeline")
+        st.write(data.get("timeline") or "未提及")
 
     with right:
-        st.subheader("🚧 客戶疑慮 / Objections")
-        objections = data.get("objections", [])
-        st.write("\n".join(f"- {x}" for x in objections) if objections else "未提及")
+        st.subheader("🚧 Objection")
+        st.write(data.get("objection") or "未提及")
 
-        st.subheader("✅ 下一步行動")
-        actions = data.get("next_actions", [])
-        st.write("\n".join(f"- {x}" for x in actions) if actions else "未提及")
+        st.subheader("👑 Decision Maker")
+        dm = data.get("decision_maker") or {}
+        st.write(f"**姓名：** {dm.get('name') or '未提及'}")
+        st.write(f"**角色：** {dm.get('role') or '未提及'}")
+        st.write(f"**本場出席：** {'是' if dm.get('attended') else '否'}")
 
-        st.subheader("📅 Follow-up")
-        fu = data.get("follow_up", {})
-        st.write(fu.get("raw_text") or "未提及")
-        if fu.get("normalized_date"):
-            st.caption(f"Normalized: {fu['normalized_date']}")
+        st.subheader("✅ Next Action")
+        st.write(data.get("next_action") or "未提及")
 
-        st.subheader("🔥 Opportunity Score")
-        st.metric("Score", data.get("opportunity_score", "UNKNOWN"))
-        st.caption(data.get("opportunity_reason", ""))
-
-    st.subheader("💡 AI Sales 建議")
-    recs = data.get("sales_recommendations", [])
-    st.write("\n".join(f"- {x}" for x in recs) if recs else "未提及")
-
+    st.subheader("🧾 Evidence Quotes")
+    quotes = data.get("quotes") or {}
+    quote_labels = {
+        "budget": "💰 Budget",
+        "objection": "🚧 Objection",
+        "plan": "📦 Plan",
+        "decision_maker": "👑 Decision Maker",
+    }
+    for key, label in quote_labels.items():
+        quote = quotes.get(key)
+        st.markdown(f"**{label}**")
+        st.write(f"「{quote}」" if quote else "未提及")
 
 def process_source(
     source_type,
@@ -988,22 +990,18 @@ def process_source(
     else:
         translated_text = "（未啟用翻譯）"
 
-    sales_intelligence, analysis_usage = analyze_sales_strict(transcription_payload)
+    sales_record, analysis_usage = analyze_sales_strict(transcription_payload)
     api_usage.append(analysis_usage)
 
-    final_meeting_json = {
-        **transcription_payload,
-        "translation": {
-            "target_language": target_language,
-            "speaker_transcript": translated_text,
-        },
-        "sales_intelligence": sales_intelligence,
-        "api_usage_estimate": {
-            "items": api_usage,
-            "total_estimated_cost_usd": round(sum(float(x.get("estimated_cost_usd", 0) or 0) for x in api_usage), 6),
-            "note": "Text-call costs use response token usage. Duration-only audio transcription uses a conservative internal planning allowance; verify final charges in OpenAI Usage/Costs.",
-        },
+    api_usage_estimate = {
+        "items": api_usage,
+        "total_estimated_cost_usd": round(sum(float(x.get("estimated_cost_usd", 0) or 0) for x in api_usage), 6),
+        "note": "Text-call costs use response token usage. Duration-only audio transcription uses a conservative internal planning allowance; verify final charges in OpenAI Usage/Costs.",
     }
+
+    # meeting_json is intentionally the FINAL CRM JSON only.
+    # The raw transcription and processing metadata remain available separately in the UI/session.
+    final_meeting_json = sales_record
 
     return {
         "company": company,
@@ -1014,11 +1012,14 @@ def process_source(
         "speaker_segments": segments,
         "speaker_transcript": speaker_transcript,
         "translation": translated_text,
-        "sales_intelligence": sales_intelligence,
-        "analysis": json.dumps(sales_intelligence, ensure_ascii=False, indent=2),
+        "sales_intelligence": sales_record,
+        "analysis": json.dumps(sales_record, ensure_ascii=False, indent=2),
         "meeting_json": final_meeting_json,
+        "transcription_json": transcription_payload,
+        "source": source_meta,
         "api_usage": api_usage,
-        "estimated_api_cost_usd": final_meeting_json["api_usage_estimate"]["total_estimated_cost_usd"],
+        "api_usage_estimate": api_usage_estimate,
+        "estimated_api_cost_usd": api_usage_estimate["total_estimated_cost_usd"],
     }
 
 
@@ -1257,7 +1258,7 @@ if page == "🎙️ 新增會議":
     if result:
         st.divider()
 
-        source_info = result.get("meeting_json", {}).get("source", {})
+        source_info = result.get("source", {})
         if source_info.get("input_type") == "pdf_upload":
             method = source_info.get("pdf_text_method", "unknown")
             if method == "tesseract_ocr":
@@ -1270,7 +1271,7 @@ if page == "🎙️ 新增會議":
         est_cost = float(result.get("estimated_api_cost_usd", 0) or 0)
         st.metric("💵 本次 API 估計成本", f"US${est_cost:.4f}")
         with st.expander("查看本次 API 用量估計"): 
-            st.json(result.get("meeting_json", {}).get("api_usage_estimate", {}))
+            st.json(result.get("api_usage_estimate", {}))
 
         st.header("📝 Meeting Transcript")
 
@@ -1297,18 +1298,18 @@ if page == "🎙️ 新增會議":
             )
 
         st.divider()
-        st.header("🧠 Strict JSON Sales Intelligence")
+        st.header("🧠 Final Strict CRM JSON")
         render_sales_intelligence(result["sales_intelligence"])
 
-        with st.expander("🔧 查看 Sales Intelligence JSON"):
-            st.json(result["sales_intelligence"])
-
-        with st.expander("🧩 查看完整 Meeting JSON"):
+        with st.expander("🔧 查看最終 CRM JSON"):
             st.json(result["meeting_json"])
+
+        with st.expander("🗣️ 查看轉錄 JSON（Speaker / timestamps / source）"):
+            st.json(result.get("transcription_json", {}))
 
         json_download = json.dumps(result["meeting_json"], ensure_ascii=False, indent=2)
         st.download_button(
-            "⬇️ 下載完整 Meeting JSON",
+            "⬇️ 下載最終 CRM JSON",
             data=json_download,
             file_name=f"{result['meeting_json']['meeting_id']}.json",
             mime="application/json",
@@ -1473,22 +1474,21 @@ elif page == "📚 Meeting History":
                     st.write(salesperson or "未填寫")
 
                 saved_json = safe_json_loads(meeting_json_text)
-                if isinstance(saved_json, dict):
-                    segments = saved_json.get("transcription", {}).get("segments", [])
-                    if segments:
-                        st.subheader("🗣️ Speaker Transcript")
-                        for segment in segments:
-                            st.markdown(f"**{segment.get('speaker', 'Unknown')}**")
-                            st.write(segment.get("text", ""))
+                st.subheader("📝 Transcript")
+                st.write(transcript or "未保存逐字稿")
 
-                    st.subheader("🧠 Sales Intelligence")
-                    intelligence = saved_json.get("sales_intelligence", {})
+                if isinstance(saved_json, dict):
+                    # New records store the final CRM JSON directly.
+                    # Legacy records may still wrap it inside sales_intelligence.
+                    if "sales_intelligence" in saved_json:
+                        intelligence = saved_json.get("sales_intelligence", {})
+                    else:
+                        intelligence = saved_json
+                    st.subheader("🧠 Final CRM Record")
                     render_sales_intelligence(intelligence)
-                    with st.expander("🔧 查看已儲存 Meeting JSON"):
-                        st.json(saved_json)
+                    with st.expander("🔧 查看已儲存 Final JSON"):
+                        st.json(intelligence)
                 else:
-                    st.subheader("📝 Transcript")
-                    st.write(transcript)
                     st.subheader("🧠 舊版 Analysis")
                     parsed_analysis = safe_json_loads(analysis)
                     if isinstance(parsed_analysis, dict):
@@ -1526,7 +1526,10 @@ elif page == "📊 Sales Dashboard":
 
             saved_json = safe_json_loads(meeting_json_text)
             if isinstance(saved_json, dict):
-                score = saved_json.get("sales_intelligence", {}).get("opportunity_score", "UNKNOWN")
+                record = saved_json.get("sales_intelligence", saved_json)
+                score = stage_to_opportunity_score(record.get("stage"))
+                if score == "UNKNOWN":
+                    score = extract_opportunity_score(record)
             else:
                 score = extract_opportunity_score(analysis)
 
@@ -1673,7 +1676,7 @@ elif page == "💬 Ask Sales AI":
 只能根據提供的 Sales Meeting Memory JSON 回答。
 不可捏造；資料不足時要明確說明。
 使用繁體中文、結論優先，並在需要時提出具體下一步。
-若比較客戶，請依據 opportunity_score、預算、需求、決策者、objections、follow_up 與 next_actions 排序。
+若比較客戶，請依據 stage、budget、need、decision_maker、objection、follow_up_date 與 next_action 排序；需要時引用 quotes 作為證據。
 """,
                             input=f"SALES MEETING MEMORY:\n{sales_memory}\n\nQUESTION:\n{final_question}",
                             store=False,
