@@ -293,6 +293,17 @@ def init_database():
         """
     )
 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lead_discoveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT,
+            source_company TEXT,
+            result_json TEXT
+        )
+        """
+    )
+
     cursor.execute("PRAGMA table_info(meetings)")
     columns = {row[1] for row in cursor.fetchall()}
     if "meeting_json" not in columns:
@@ -1026,6 +1037,422 @@ def process_source(
 init_database()
 
 
+
+# =========================================================
+# Knowledge Base + AI Lead Discovery
+# =========================================================
+
+LEAD_DISCOVERY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "source_company": {"type": ["string", "null"]},
+        "generated_at": {"type": "string"},
+        "knowledge_profile": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "company": {"type": ["string", "null"]},
+                "customer_type": {"type": ["string", "null"]},
+                "current_stage": {"type": ["string", "null"]},
+                "needs": {"type": "array", "items": {"type": "string"}},
+                "plans": {"type": "array", "items": {"type": "string"}},
+                "budget_signals": {"type": "array", "items": {"type": "string"}},
+                "objections": {"type": "array", "items": {"type": "string"}},
+                "decision_roles": {"type": "array", "items": {"type": "string"}},
+                "lookalike_traits": {"type": "array", "items": {"type": "string"}},
+                "search_keywords": {"type": "array", "items": {"type": "string"}}
+            },
+            "required": [
+                "company", "customer_type", "current_stage", "needs", "plans",
+                "budget_signals", "objections", "decision_roles",
+                "lookalike_traits", "search_keywords"
+            ]
+        },
+        "search_queries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "query": {"type": "string"},
+                    "purpose": {
+                        "type": "string",
+                        "enum": ["lookalike", "hiring_signal", "growth_signal"]
+                    }
+                },
+                "required": ["query", "purpose"]
+            }
+        },
+        "leads": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "company_name": {"type": "string"},
+                    "website": {"type": ["string", "null"]},
+                    "industry": {"type": ["string", "null"]},
+                    "location": {"type": ["string", "null"]},
+                    "fit_score": {"type": "integer"},
+                    "confidence": {
+                        "type": "string",
+                        "enum": ["高", "中", "低"]
+                    },
+                    "why_match": {"type": "string"},
+                    "signals": {"type": "array", "items": {"type": "string"}},
+                    "suggested_contact_role": {"type": ["string", "null"]},
+                    "recommended_next_action": {"type": "string"},
+                    "evidence": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "title": {"type": "string"},
+                                "url": {"type": "string"},
+                                "reason": {"type": "string"}
+                            },
+                            "required": ["title", "url", "reason"]
+                        }
+                    }
+                },
+                "required": [
+                    "company_name", "website", "industry", "location",
+                    "fit_score", "confidence", "why_match", "signals",
+                    "suggested_contact_role", "recommended_next_action",
+                    "evidence"
+                ]
+            }
+        }
+    },
+    "required": [
+        "source_company", "generated_at", "knowledge_profile",
+        "search_queries", "leads"
+    ]
+}
+
+
+KNOWLEDGE_PROFILE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "company": {"type": ["string", "null"]},
+        "customer_type": {"type": ["string", "null"]},
+        "current_stage": {"type": ["string", "null"]},
+        "needs": {"type": "array", "items": {"type": "string"}},
+        "plans": {"type": "array", "items": {"type": "string"}},
+        "budget_signals": {"type": "array", "items": {"type": "string"}},
+        "objections": {"type": "array", "items": {"type": "string"}},
+        "decision_roles": {"type": "array", "items": {"type": "string"}},
+        "lookalike_traits": {"type": "array", "items": {"type": "string"}},
+        "search_keywords": {"type": "array", "items": {"type": "string"}}
+    },
+    "required": [
+        "company", "customer_type", "current_stage", "needs", "plans",
+        "budget_signals", "objections", "decision_roles",
+        "lookalike_traits", "search_keywords"
+    ]
+}
+
+
+SEARCH_PLAN_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "queries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "query": {"type": "string"},
+                    "purpose": {
+                        "type": "string",
+                        "enum": ["lookalike", "hiring_signal", "growth_signal"]
+                    }
+                },
+                "required": ["query", "purpose"]
+            }
+        }
+    },
+    "required": ["queries"]
+}
+
+
+def get_company_knowledge(company_name):
+    """Return final CRM JSON records for one existing customer."""
+    records = []
+    for meeting in get_meetings():
+        if (meeting[2] or "").strip() != (company_name or "").strip():
+            continue
+        payload = safe_json_loads(meeting[9])
+        if payload:
+            records.append(payload)
+    return records
+
+
+def summarize_company_knowledge(company_name, records):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        instructions="""
+你是 B2B Sales Knowledge Analyst。
+請把同一家公司歷次 Meeting CRM JSON 統整成可用於尋找相似潛在客戶的客戶輪廓。
+
+規則：
+1. 只能根據提供資料整理，不可補造。
+2. lookalike_traits 應描述「什麼樣的其他公司可能有相似需求」，不要包含私人個資。
+3. search_keywords 應適合搜尋公開公司網站、新聞、產業資訊與公開職缺訊號。
+4. 不要尋找、推斷或輸出私人電話、私人 Email、住址等個人資料。
+5. 使用繁體中文。
+""",
+        input=json.dumps({
+            "company": company_name,
+            "meeting_records": records
+        }, ensure_ascii=False),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "company_knowledge_profile",
+                "schema": KNOWLEDGE_PROFILE_SCHEMA,
+                "strict": True
+            }
+        },
+        store=False
+    )
+    return json.loads(response.output_text)
+
+
+def generate_lead_search_plan(knowledge_profile, geography="台灣"):
+    response = client.responses.create(
+        model="gpt-5-mini",
+        instructions=f"""
+你是 B2B Lead Research Planner。
+根據既有客戶 Knowledge Profile，產生 3 個互補的公開網路搜尋查詢：
+
+1. lookalike：尋找產業、商業模式、需求情境相似的公司。
+2. hiring_signal：利用公開職缺作為成長、擴編、數位轉型、海外拓展或特定能力需求的公司級訊號。
+3. growth_signal：利用公司官網、新聞、政府／協會／產業公開資訊尋找擴產、投資、新市場、新產品等訊號。
+
+地理範圍：{geography}
+
+重要：
+- 目標是「公司級潛在客戶」，不是求職者或個人名單。
+- 不得要求私人聯絡資訊或履歷資料。
+- 不要把 LinkedIn 自動爬取設計成搜尋策略。
+- 查詢要短、可直接交給 Web Search。
+""",
+        input=json.dumps(knowledge_profile, ensure_ascii=False),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "lead_search_plan",
+                "schema": SEARCH_PLAN_SCHEMA,
+                "strict": True
+            }
+        },
+        store=False
+    )
+    payload = json.loads(response.output_text)
+    # Keep bounded search cost and latency.
+    return payload.get("queries", [])[:3]
+
+
+def extract_web_citations(response):
+    """Extract title/url citations from a Responses API web_search response."""
+    try:
+        data = response.model_dump()
+    except Exception:
+        return []
+
+    seen = set()
+    citations = []
+    for item in data.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for content in item.get("content", []):
+            for ann in content.get("annotations", []) or []:
+                if ann.get("type") != "url_citation":
+                    continue
+                url = (ann.get("url") or "").strip()
+                title = (ann.get("title") or url).strip()
+                # LinkedIn automated scraping/access is intentionally not used.
+                if "linkedin.com" in url.lower():
+                    continue
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                citations.append({
+                    "title": title,
+                    "url": url
+                })
+    return citations
+
+
+def run_public_lead_search(query, purpose, geography="台灣"):
+    source_guidance = {
+        "lookalike": (
+            "優先尋找公司官網、產品頁、公開新聞、產業協會、政府／公開企業資料。"
+        ),
+        "hiring_signal": (
+            "把公開職缺當作『公司級商業訊號』，例如擴編、海外業務、數位轉型、"
+            "新廠、新產品、CRM／行銷／供應鏈能力需求。可參考公開人力銀行職缺頁，"
+            "但不要取得履歷、求職者個資或會員限定內容。"
+        ),
+        "growth_signal": (
+            "優先尋找擴廠、投資、新市場、海外拓展、新產品、策略合作、招募成長等公開訊號。"
+        ),
+    }.get(purpose, "")
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        tools=[
+            {
+                "type": "web_search",
+                "search_context_size": "medium"
+            }
+        ],
+        instructions="""
+你是 B2B Public-Web Lead Research Agent。
+
+只研究公開可存取、公司級的商業資訊。
+不得蒐集或輸出私人電話、私人 Email、住址、履歷內容或其他非必要個人資料。
+不要自動爬取 LinkedIn，也不要繞過登入、robots、CAPTCHA、rate limit 或其他存取控制。
+若資料來自公開職缺，只把它當成「公司成長／需求訊號」，不要分析求職者。
+每個候選公司都要有可驗證的公開來源。
+""",
+        input=f"""
+地理範圍：{geography}
+搜尋目的：{purpose}
+來源偏好：{source_guidance}
+
+搜尋查詢：
+{query}
+
+請找出可能值得 B2B 業務開發的『公司』，並用繁體中文簡短說明：
+- 公司名稱
+- 公開訊號
+- 為何值得進一步研究
+- 來源依據
+
+不要列個人聯絡資料。
+""",
+        store=False
+    )
+
+    return {
+        "query": query,
+        "purpose": purpose,
+        "text": response.output_text,
+        "citations": extract_web_citations(response)
+    }
+
+
+def normalize_lead_discovery(source_company, knowledge_profile, search_plan, search_runs, max_leads=8):
+    # Flatten citations so the strict-output pass has actual URLs available.
+    source_catalog = []
+    seen = set()
+    for run in search_runs:
+        for c in run.get("citations", []):
+            if c["url"] in seen:
+                continue
+            seen.add(c["url"])
+            source_catalog.append(c)
+
+    response = client.responses.create(
+        model="gpt-5-mini",
+        instructions=f"""
+你是 B2B Lead Qualification Analyst。
+
+根據：
+1. 既有客戶 Knowledge Profile
+2. 公開 Web Search 的研究摘要
+3. 實際 source catalog URL
+
+選出最多 {max_leads} 家『公司級』潛在新客戶。
+
+評分 fit_score 0-100：
+- 與既有客戶需求／產業情境相似度
+- 是否存在具體公開成長、招聘、擴產、轉型或市場訊號
+- 是否有合理的 B2B 切入點
+- 證據品質
+
+規則：
+- 不要建立或推測個人私人聯絡資料。
+- suggested_contact_role 只能是職務類型，例如「採購經理」「業務營運主管」「行銷主管」。
+- evidence.url 必須只能使用 source catalog 中提供的 URL，不可自行捏造 URL。
+- 若證據不足就降低 confidence / fit_score，不可硬湊。
+- 排除 LinkedIn URL。
+- 使用繁體中文。
+""",
+        input=json.dumps({
+            "source_company": source_company,
+            "knowledge_profile": knowledge_profile,
+            "search_plan": search_plan,
+            "search_runs": search_runs,
+            "source_catalog": source_catalog
+        }, ensure_ascii=False),
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "lead_discovery_result",
+                "schema": LEAD_DISCOVERY_SCHEMA,
+                "strict": True
+            }
+        },
+        store=False
+    )
+    return json.loads(response.output_text)
+
+
+def save_lead_discovery_local(source_company, payload):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO lead_discoveries (
+            created_at,
+            source_company,
+            result_json
+        ) VALUES (?, ?, ?)
+        """,
+        (
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            source_company,
+            json.dumps(payload, ensure_ascii=False),
+        )
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_lead_discoveries(limit=10):
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, created_at, source_company, result_json
+        FROM lead_discoveries
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,)
+    )
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def backup_lead_discovery_to_s3(source_company, payload):
+    if not AWS_S3_BUCKET:
+        return None
+    safe_company = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "-", source_company or "unknown-company").strip("-")
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    date_part = datetime.now().strftime("%Y-%m-%d")
+    key = f"{AWS_S3_PREFIX}/lead-discovery/{date_part}/{safe_company}-{timestamp}.json"
+    return upload_json_to_s3(payload, key)
+
+
 # =========================================================
 # Session State
 # =========================================================
@@ -1046,6 +1473,7 @@ page = st.sidebar.radio(
         "📚 Meeting History",
         "📊 Sales Dashboard",
         "💬 Ask Sales AI",
+        "🧠 Knowledge Base",
         "☁️ AWS Integration",
     ],
 )
@@ -1328,6 +1756,214 @@ if page == "🎙️ 新增會議":
                     st.warning(f"⚠️ 本機已儲存，但 AWS S3 備份失敗：{aws_error}")
             else:
                 st.info("ℹ️ 尚未設定 AWS_S3_BUCKET，因此本次只存到 SQLite。")
+
+
+# =========================================================
+# Knowledge Base + Lead Discovery
+# =========================================================
+
+elif page == "🧠 Knowledge Base":
+    st.title("🧠 Customer Knowledge Base")
+    st.write(
+        "先把既有客戶歷次 Meeting JSON 統整成客戶知識輪廓，再使用公開 Web Search 找出具相似需求或成長訊號的潛在新客戶。"
+    )
+
+    meetings = get_meetings()
+    companies = sorted({(m[2] or "").strip() for m in meetings if (m[2] or "").strip()})
+
+    if not companies:
+        st.info("目前沒有可用的客戶 Meeting JSON。請先儲存至少一場 Meeting。")
+    else:
+        selected_company = st.selectbox(
+            "選擇要作為 Look-alike 基準的既有客戶",
+            companies
+        )
+        records = get_company_knowledge(selected_company)
+
+        st.caption(f"Knowledge Base records：{len(records)}")
+
+        with st.expander("查看原始 Knowledge Base JSON"):
+            st.json(records)
+
+        cache_key = f"knowledge_profile::{selected_company}"
+        if cache_key not in st.session_state:
+            st.session_state[cache_key] = None
+
+        if st.button("🧠 AI 統整這個客戶的知識庫", use_container_width=True):
+            if not records:
+                st.warning("找不到這家公司的有效 Meeting JSON。")
+            else:
+                with st.spinner("正在統整需求、方案、預算訊號、阻礙與 Look-alike 特徵..."):
+                    st.session_state[cache_key] = summarize_company_knowledge(
+                        selected_company,
+                        records
+                    )
+
+        knowledge_profile = st.session_state.get(cache_key)
+
+        if knowledge_profile:
+            st.subheader("Customer Knowledge Profile")
+            st.json(knowledge_profile)
+
+            st.divider()
+            st.header("🔎 AI Potential Customer Discovery")
+            st.write(
+                "系統會把 Knowledge Profile 轉成搜尋策略，研究公開公司網站、新聞、產業資訊與公開職缺訊號，"
+                "最後產生有來源證據的潛在公司清單。"
+            )
+
+            st.info(
+                "LinkedIn：此版本不做自動爬取。若未來取得 LinkedIn 正式授權／合作 API，"
+                "可以再用 Source Adapter 接入；現在以公開 Web Search 與合法可存取來源為主。"
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                geography = st.text_input("目標市場", value="台灣")
+            with c2:
+                max_leads = st.slider("最多輸出幾家潛在客戶", 3, 12, 6)
+
+            st.markdown(
+                """
+                **目前搜尋訊號**
+                - Look-alike 公司：產業／商業模式／需求情境相似
+                - 公開職缺：擴編、海外業務、數位轉型、新能力需求
+                - Growth signals：擴廠、投資、新產品、新市場、策略合作
+                """
+            )
+
+            if st.button(
+                "🚀 從知識庫尋找潛在新客戶",
+                type="primary",
+                use_container_width=True
+            ):
+                try:
+                    with st.spinner("Step 1/3：AI 正在建立 Lead Search Strategy..."):
+                        search_plan = generate_lead_search_plan(
+                            knowledge_profile,
+                            geography=geography
+                        )
+
+                    st.session_state["lead_search_plan"] = search_plan
+
+                    search_runs = []
+                    progress = st.progress(0)
+                    status = st.empty()
+
+                    for idx, q in enumerate(search_plan):
+                        status.write(
+                            f"Step 2/3：搜尋公開網路 ({idx + 1}/{len(search_plan)}) — {q['purpose']}"
+                        )
+                        run = run_public_lead_search(
+                            q["query"],
+                            q["purpose"],
+                            geography=geography
+                        )
+                        search_runs.append(run)
+                        progress.progress(int(((idx + 1) / max(len(search_plan), 1)) * 100))
+
+                    status.write("Step 3/3：AI 正在去重、評分並產生潛在客戶 JSON...")
+                    result = normalize_lead_discovery(
+                        selected_company,
+                        knowledge_profile,
+                        search_plan,
+                        search_runs,
+                        max_leads=max_leads
+                    )
+
+                    st.session_state["lead_discovery_result"] = result
+                    st.session_state["lead_search_runs"] = search_runs
+
+                    save_lead_discovery_local(selected_company, result)
+
+                    s3_uri = None
+                    if AWS_S3_BUCKET:
+                        try:
+                            s3_uri = backup_lead_discovery_to_s3(selected_company, result)
+                        except Exception as e:
+                            st.warning(f"Lead JSON 已存本機 DB，但 S3 備份失敗：{e}")
+
+                    status.empty()
+                    progress.empty()
+                    st.success("✅ Potential Customer Discovery 完成")
+                    if s3_uri:
+                        st.success(f"☁️ 已備份至：{s3_uri}")
+
+                except Exception as e:
+                    st.error("❌ Lead Discovery 失敗")
+                    st.exception(e)
+
+            result = st.session_state.get("lead_discovery_result")
+            if result:
+                st.divider()
+                st.subheader("🎯 Potential Leads")
+
+                leads = sorted(
+                    result.get("leads", []),
+                    key=lambda x: x.get("fit_score", 0),
+                    reverse=True
+                )
+
+                for i, lead in enumerate(leads, start=1):
+                    with st.container(border=True):
+                        left, right = st.columns([4, 1])
+                        with left:
+                            st.markdown(f"### {i}. {lead['company_name']}")
+                            meta = " ｜ ".join(
+                                x for x in [
+                                    lead.get("industry"),
+                                    lead.get("location"),
+                                    lead.get("suggested_contact_role")
+                                ] if x
+                            )
+                            if meta:
+                                st.caption(meta)
+
+                            st.write(lead.get("why_match", ""))
+
+                            if lead.get("signals"):
+                                st.markdown("**Signals**")
+                                for signal in lead["signals"]:
+                                    st.write(f"- {signal}")
+
+                            st.markdown("**Recommended Next Action**")
+                            st.write(lead.get("recommended_next_action", ""))
+
+                            if lead.get("evidence"):
+                                with st.expander("Evidence / Sources"):
+                                    for ev in lead["evidence"]:
+                                        st.markdown(
+                                            f"- [{ev['title']}]({ev['url']}) — {ev['reason']}"
+                                        )
+
+                        with right:
+                            st.metric("Fit Score", lead.get("fit_score", 0))
+                            st.caption(f"Confidence：{lead.get('confidence', '低')}")
+
+                st.divider()
+                with st.expander("查看完整 Lead Discovery JSON"):
+                    st.json(result)
+
+                st.download_button(
+                    "⬇️ 下載 Potential Leads JSON",
+                    data=json.dumps(result, ensure_ascii=False, indent=2),
+                    file_name=f"{selected_company}_lead_discovery.json",
+                    mime="application/json",
+                    use_container_width=True
+                )
+
+            recent = get_recent_lead_discoveries(5)
+            if recent:
+                st.divider()
+                st.subheader("Recent Lead Discovery Runs")
+                rows = []
+                for item in recent:
+                    rows.append({
+                        "ID": item[0],
+                        "Created At": item[1],
+                        "Source Company": item[2]
+                    })
+                st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
 # =========================================================
